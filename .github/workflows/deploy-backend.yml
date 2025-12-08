@@ -38,8 +38,11 @@ jobs:
       
       - name: Check imports
         working-directory: ./backend
+        env:
+          CI: true
+          GITHUB_ACTIONS: true
         run: |
-          python -c "import app; print('All imports successful')"
+          python -c "import app; print('✅ All imports successful')"
 
   deploy-render:
     name: Deploy to Render

@@ -47,6 +47,7 @@ jobs:
         env:
           CI: true
           GITHUB_ACTIONS: true
+          MONGO_URI: ${{ secrets.MONGO_URI }}  # Optional: Use GitHub Secret if you want to test DB connection
         run: |
           python -c "import app; print('✅ All imports successful')"
       
@@ -55,6 +56,7 @@ jobs:
         env:
           CI: true
           GITHUB_ACTIONS: true
+          MONGO_URI: ${{ secrets.MONGO_URI }}  # Optional: Use GitHub Secret if you want to test DB connection
         run: |
           python -c "from app import app; print('✅ Flask app initialized successfully')"
 

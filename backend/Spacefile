@@ -1,0 +1,17 @@
+v: 0
+app_name: pharmacy-backend
+micros:
+  - name: api
+    src: ./
+    engine: python3.9
+    run: python app.py
+    env:
+      - key: MONGO_URI
+        value: ${{MONGO_URI}}
+      - key: JWT_SECRET_KEY
+        value: ${{JWT_SECRET_KEY}}
+      - key: FLASK_ENV
+        value: production
+      - key: FLASK_DEBUG
+        value: "False"
+

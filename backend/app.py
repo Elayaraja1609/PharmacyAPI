@@ -243,8 +243,20 @@ def admin_login():
               example: admin
       400:
         description: Missing username or password
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Username and password required"
       401:
         description: Invalid credentials
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Invalid credentials"
     """
     data = request.get_json()
     username = data.get('username')
@@ -352,8 +364,20 @@ def create_user():
               type: string
       400:
         description: Missing required fields or user already exists
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Missing required fields: username, password, role"
       403:
         description: Admin access required
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Admin access required"
     """
     data = request.get_json()
     required_fields = ['username', 'password', 'role']
@@ -421,6 +445,12 @@ def get_users():
                 type: string
       403:
         description: Admin access required
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Admin access required"
     """
     role_filter = request.args.get('role', '')
     query = {}
@@ -530,42 +560,9 @@ def delete_user(user_id):
         description: User not found
       403:
         description: Admin access required
-    """
-    try:
-        # Prevent deleting the default admin
-        user = users_collection.find_one({'_id': ObjectId(user_id)})
-        if user and user.get('username') == 'admin':
-            return jsonify({'message': 'Cannot delete default admin user'}), 400
-        
-        result = users_collection.delete_one({'_id': ObjectId(user_id)})
-        if result.deleted_count == 0:
-            return jsonify({'message': 'User not found'}), 404
-        return jsonify({'message': 'User deleted successfully'}), 200
-    except:
-        return jsonify({'message': 'Invalid user ID'}), 400
-
-# ==================== PRODUCT ROUTES ====================
-
-@app.route('/api/products', methods=['GET'])
-def get_products():
-    """
-    Get Products
-    ---
-    tags:
-      - Products
-    summary: Get all products
-    description: Retrieve a list of all products. Supports optional search query parameter.
-    parameters:
-      - in: query
-        name: search
-        type: string
-        required: false
-        description: Search term to filter products by name, description, or category
-        example: aspirin
-    responses:
-      200:
-        description: List of products
         schema:
+          type: object
+          properties:
           type: array
           items:
             type: object

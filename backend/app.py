@@ -79,6 +79,10 @@ swagger_template = {
             "description": "User management endpoints (admin only)"
         },
         {
+            "name": "Customers",
+            "description": "Customer registration and authentication endpoints"
+        },
+        {
             "name": "Testimonials",
             "description": "Customer testimonials and reviews endpoints"
         },
@@ -100,7 +104,7 @@ db = None
 products_collection = None
 orders_collection = None
 offers_collection = None
-users_collection = None
+users_collection = None  # Unified collection for both admin and customer users
 testimonials_collection = None
 callback_requests_collection = None
 
@@ -121,7 +125,7 @@ def get_db():
             products_collection = db.products
             orders_collection = db.orders
             offers_collection = db.offers
-            users_collection = db.users
+            users_collection = db.users  # Unified collection for admin and customer
             testimonials_collection = db.testimonials
             callback_requests_collection = db.callback_requests
         except Exception as e:
@@ -175,13 +179,18 @@ def role_required(*allowed_roles):
         return decorated_function
     return decorator
 
-# Admin only decorator (backward compatibility)
+# Admin only decorator
 def admin_required(f):
     @wraps(f)
     @jwt_required()
     def decorated_function(*args, **kwargs):
-        current_user = get_jwt_identity()
-        user = users_collection.find_one({'username': current_user})
+        user_id = get_jwt_identity()
+        try:
+            user = users_collection.find_one({'_id': ObjectId(user_id)})
+        except:
+            # Fallback for old username-based tokens
+            user = users_collection.find_one({'username': user_id})
+        
         if not user or user.get('role') != 'admin':
             return jsonify({'message': 'Admin access required'}), 403
         return f(*args, **kwargs)
@@ -204,15 +213,15 @@ def root():
 
 # ==================== AUTH ROUTES ====================
 
-@app.route('/api/admin/login', methods=['POST'])
-def admin_login():
+@app.route('/api/login', methods=['POST'])
+def unified_login():
     """
-    Admin Login
+    Unified Login
     ---
     tags:
-      - Admin
-    summary: Authenticate admin user
-    description: Login endpoint for admin users. Returns JWT token on successful authentication.
+      - Auth
+    summary: Authenticate user (admin or customer)
+    description: Unified login endpoint for both admin and customer users. Returns JWT token and user role on successful authentication.
     parameters:
       - in: body
         name: body
@@ -220,15 +229,16 @@ def admin_login():
         schema:
           type: object
           required:
-            - username
+            - identifier
             - password
           properties:
-            username:
+            identifier:
               type: string
-              example: admin
+              description: Username (for admin) or phone number (for customer)
+              example: admin or +919876543210
             password:
               type: string
-              example: admin123
+              example: password123
     responses:
       200:
         description: Login successful
@@ -237,53 +247,70 @@ def admin_login():
           properties:
             access_token:
               type: string
-              example: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
+            user_id:
+              type: string
             username:
               type: string
-              example: admin
-      400:
-        description: Missing username or password
-        schema:
-          type: object
-          properties:
-            message:
+            name:
               type: string
-              example: "Username and password required"
+            email:
+              type: string
+            phone:
+              type: string
+            role:
+              type: string
+              enum: [admin, customer]
+      400:
+        description: Missing identifier or password
       401:
         description: Invalid credentials
-        schema:
-          type: object
-          properties:
-            message:
-              type: string
-              example: "Invalid credentials"
     """
     data = request.get_json()
-    username = data.get('username')
+    identifier = data.get('identifier')  # Can be username or phone
     password = data.get('password')
     
-    if not username or not password:
-        return jsonify({'message': 'Username and password required'}), 400
+    if not identifier or not password:
+        return jsonify({'message': 'Identifier (username/phone) and password required'}), 400
     
-    user = users_collection.find_one({'username': username})
+    # Try to find user by username first (for admin)
+    user = users_collection.find_one({'username': identifier})
+    
+    # If not found by username, try by phone (for customer)
+    if not user:
+        user = users_collection.find_one({'phone': identifier})
+    
     if user and check_password_hash(user['password'], password):
-        access_token = create_access_token(identity=username)
-        return jsonify({
+        user_id = str(user['_id'])
+        access_token = create_access_token(identity=user_id)
+        
+        response_data = {
             'access_token': access_token,
-            'username': username,
-            'role': user.get('role', 'admin')
-        }), 200
+            'user_id': user_id,
+            'role': user.get('role', 'customer')
+        }
+        
+        # Add role-specific fields
+        if user.get('role') == 'admin':
+            response_data['username'] = user.get('username')
+        else:  # customer
+            response_data['name'] = user.get('name')
+            response_data['email'] = user.get('email')
+            response_data['phone'] = user.get('phone')
+            if user.get('username'):
+                response_data['username'] = user.get('username')
+        
+        return jsonify(response_data), 200
     
     return jsonify({'message': 'Invalid credentials'}), 401
 
-@app.route('/api/admin/verify', methods=['GET'])
+@app.route('/api/verify', methods=['GET'])
 @jwt_required()
 def verify_token():
     """
     Verify Token
     ---
     tags:
-      - Admin
+      - Auth
     summary: Verify JWT token
     description: Verify if the current JWT token is valid and return user information.
     security:
@@ -294,19 +321,242 @@ def verify_token():
         schema:
           type: object
           properties:
+            user_id:
+              type: string
             username:
+              type: string
+            name:
+              type: string
+            email:
+              type: string
+            phone:
               type: string
             role:
               type: string
       401:
         description: Invalid or expired token
+      404:
+        description: User not found
     """
-    current_user = get_jwt_identity()
-    user = users_collection.find_one({'username': current_user})
+    user_id = get_jwt_identity()
+    user = users_collection.find_one({'_id': ObjectId(user_id)})
+    if user:
+        response_data = {
+            'user_id': str(user['_id']),
+            'role': user.get('role', 'customer')
+        }
+        
+        if user.get('role') == 'admin':
+            response_data['username'] = user.get('username')
+        else:  # customer
+            response_data['name'] = user.get('name')
+            response_data['email'] = user.get('email')
+            response_data['phone'] = user.get('phone')
+            if user.get('username'):
+                response_data['username'] = user.get('username')
+        
+        return jsonify(response_data), 200
+    return jsonify({'message': 'User not found'}), 404
+
+# Keep old admin login for backward compatibility (deprecated)
+@app.route('/api/admin/login', methods=['POST'])
+def admin_login():
+    """
+    Admin Login (Deprecated - Use /api/login instead)
+    ---
+    tags:
+      - Admin
+    summary: Authenticate admin user (Deprecated)
+    description: DEPRECATED - Use /api/login instead. Login endpoint for admin users.
+    """
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    
+    if not username or not password:
+        return jsonify({'message': 'Username and password required'}), 400
+    
+    # Use unified login logic
+    user = users_collection.find_one({'username': username})
+    if user and check_password_hash(user['password'], password):
+        user_id = str(user['_id'])
+        access_token = create_access_token(identity=user_id)
+        return jsonify({
+            'access_token': access_token,
+            'username': username,
+            'role': user.get('role', 'admin')
+        }), 200
+    
+    return jsonify({'message': 'Invalid credentials'}), 401
+
+@app.route('/api/admin/verify', methods=['GET'])
+@jwt_required()
+def verify_admin_token():
+    """
+    Verify Admin Token (Deprecated - Use /api/verify instead)
+    ---
+    tags:
+      - Admin
+    summary: Verify JWT token (Deprecated)
+    description: DEPRECATED - Use /api/verify instead.
+    """
+    user_id = get_jwt_identity()
+    user = users_collection.find_one({'_id': ObjectId(user_id)})
+    if user:
+        response_data = {
+            'username': user.get('username'),
+            'role': user.get('role', 'admin')
+        }
+        return jsonify(response_data), 200
+    return jsonify({'message': 'User not found'}), 404
+
+# ==================== CUSTOMER AUTH ROUTES ====================
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    """
+    User Registration
+    ---
+    tags:
+      - Auth
+    summary: Register a new user
+    description: Register a new user account. By default, all registrations are created with 'customer' role.
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - name
+            - email
+            - phone
+            - password
+          properties:
+            name:
+              type: string
+              example: John Doe
+            email:
+              type: string
+              example: john@example.com
+            phone:
+              type: string
+              example: "+919876543210"
+            password:
+              type: string
+              example: password123
+            address:
+              type: string
+              example: "123 Main St, City"
+    responses:
+      201:
+        description: User registered successfully
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+            user_id:
+              type: string
+            access_token:
+              type: string
+            name:
+              type: string
+            email:
+              type: string
+            phone:
+              type: string
+            role:
+              type: string
+      400:
+        description: Missing required fields or user already exists
+    """
+    data = request.get_json()
+    required_fields = ['name', 'email', 'phone', 'password']
+    
+    if not all(field in data for field in required_fields):
+        return jsonify({'message': 'Missing required fields: name, email, phone, password'}), 400
+    
+    # Check if user already exists
+    existing_user = users_collection.find_one({
+        '$or': [
+            {'email': data['email']},
+            {'phone': data['phone']}
+        ]
+    })
+    if existing_user:
+        return jsonify({'message': 'Email or phone already exists'}), 400
+    
+    # Create user with default role 'customer'
+    user = {
+        'name': data['name'],
+        'email': data['email'],
+        'phone': data['phone'],
+        'password': generate_password_hash(data['password']),
+        'address': data.get('address', ''),
+        'role': 'customer',  # Default role
+        'created_at': datetime.utcnow()
+    }
+    
+    result = users_collection.insert_one(user)
+    user_id = str(result.inserted_id)
+    
+    # Create access token
+    access_token = create_access_token(identity=user_id)
+    
+    return jsonify({
+        'message': 'User registered successfully',
+        'user_id': user_id,
+        'access_token': access_token,
+        'name': user['name'],
+        'email': user['email'],
+        'phone': user['phone'],
+        'role': user['role']
+    }), 201
+
+# Keep old customer register for backward compatibility
+@app.route('/api/customers/register', methods=['POST'])
+def customer_register():
+    """Deprecated - Use /api/register instead"""
+    return register()
+
+@app.route('/api/customers/login', methods=['POST'])
+def customer_login():
+    """Deprecated - Use /api/login instead"""
+    data = request.get_json()
+    phone = data.get('phone')
+    password = data.get('password')
+    
+    if not phone or not password:
+        return jsonify({'message': 'Phone number and password required'}), 400
+    
+    # Use unified login logic
+    user = users_collection.find_one({'phone': phone, 'role': 'customer'})
+    if user and check_password_hash(user['password'], password):
+        user_id = str(user['_id'])
+        access_token = create_access_token(identity=user_id)
+        return jsonify({
+            'access_token': access_token,
+            'customer_id': user_id,
+            'name': user['name'],
+            'email': user['email'],
+            'phone': user['phone']
+        }), 200
+    
+    return jsonify({'message': 'Invalid credentials'}), 401
+
+@app.route('/api/customers/verify', methods=['GET'])
+@jwt_required()
+def verify_customer_token():
+    """Deprecated - Use /api/verify instead"""
+    user_id = get_jwt_identity()
+    user = users_collection.find_one({'_id': ObjectId(user_id)})
     if user:
         return jsonify({
-            'username': current_user,
-            'role': user.get('role', 'admin')
+            'customer_id': str(user['_id']),
+            'name': user.get('name'),
+            'email': user.get('email'),
+            'phone': user.get('phone')
         }), 200
     return jsonify({'message': 'User not found'}), 404
 

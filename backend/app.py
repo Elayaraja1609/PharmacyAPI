@@ -17,7 +17,15 @@ app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key-chan
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 app.config['JWT_ALGORITHM'] = 'HS256'
 
-CORS(app)
+# CORS configuration - Allow all origins for development
+# For production, specify exact origins
+CORS(app, 
+     resources={r"/api/*": {"origins": "*"}},
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     supports_credentials=True,
+     expose_headers=["Content-Type", "Authorization"])
+
 jwt = JWTManager(app)
 
 # Swagger configuration
@@ -195,6 +203,24 @@ def admin_required(f):
             return jsonify({'message': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated_function
+
+# ==================== CORS PREFLIGHT HANDLER ====================
+
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight requests"""
+    if request.method == "OPTIONS":
+        response = jsonify({'status': 'ok'})
+        origin = request.headers.get('Origin')
+        if origin:
+            response.headers.add("Access-Control-Allow-Origin", origin)
+        else:
+            response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,X-Requested-With")
+        response.headers.add('Access-Control-Allow-Methods', "GET,PUT,POST,DELETE,OPTIONS")
+        response.headers.add('Access-Control-Allow-Credentials', "true")
+        response.headers.add('Access-Control-Max-Age', "3600")
+        return response, 200
 
 # ==================== ROOT ROUTE ====================
 
@@ -2123,10 +2149,13 @@ def get_dashboard_stats():
         'recent_orders': [serialize_doc(o) for o in recent_orders]
     }), 200
 
-# Ensure database is connected before handling requests
+# Ensure database is connected before handling requests (skip for OPTIONS)
 @app.before_request
 def ensure_db_connection():
     """Ensure MongoDB connection is established before handling requests."""
+    # Skip database connection for OPTIONS requests
+    if request.method == "OPTIONS":
+        return
     try:
         get_db()
     except Exception as e:

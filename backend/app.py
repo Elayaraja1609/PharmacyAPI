@@ -3,12 +3,13 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime, timedelta
-from bson import ObjectId
 import os
 from dotenv import load_dotenv
-from pymongo import MongoClient
+import mysql.connector
+from mysql.connector import Error
 from functools import wraps
 from flasgger import Swagger
+import json
 
 load_dotenv()
 
@@ -103,75 +104,62 @@ swagger_template = {
 
 swagger = Swagger(app, config=swagger_config, template=swagger_template)
 
-# MongoDB connection - Lazy initialization to avoid connection during import (for CI/testing)
-MONGO_URI = os.getenv('MONGO_URI', 'mongodb+srv://username:password@cluster.mongodb.net/pharmacy?retryWrites=true&w=majority')
-client = None
-db = None
+# MySQL connection - Lazy initialization to avoid connection during import (for CI/testing)
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'database': os.getenv('DB_NAME', 'pharmacy'),
+    'user': os.getenv('DB_USER', 'root'),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'port': int(os.getenv('DB_PORT', 3306)),
+    'charset': 'utf8mb4',
+    'collation': 'utf8mb4_unicode_ci',
+    'autocommit': True
+}
 
-# Collections - Will be initialized when get_db() is called
-products_collection = None
-orders_collection = None
-offers_collection = None
-users_collection = None  # Unified collection for both admin and customer users
-testimonials_collection = None
-callback_requests_collection = None
+db_connection = None
+db_cursor = None
 
 def get_db():
-    """Initialize MongoDB connection lazily. This allows imports to succeed without MongoDB connection."""
-    global client, db, products_collection, orders_collection, offers_collection
-    global users_collection, testimonials_collection, callback_requests_collection
+    """Initialize MySQL connection lazily. This allows imports to succeed without MySQL connection."""
+    global db_connection, db_cursor
     
-    if client is None:
-        # Only connect if MONGO_URI is set and not a placeholder
-        if not MONGO_URI or 'username:password' in MONGO_URI:
-            raise ConnectionError("MONGO_URI not configured. Please set MONGO_URI environment variable.")
+    if db_connection is None or not db_connection.is_connected():
         try:
-            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-            db = client.pharmacy
-            
-            # Initialize collections
-            products_collection = db.products
-            orders_collection = db.orders
-            offers_collection = db.offers
-            users_collection = db.users  # Unified collection for admin and customer
-            testimonials_collection = db.testimonials
-            callback_requests_collection = db.callback_requests
-        except Exception as e:
+            db_connection = mysql.connector.connect(**DB_CONFIG)
+            db_cursor = db_connection.cursor(dictionary=True, buffered=True)
+            print("MySQL connection established successfully")
+        except Error as e:
             # If connection fails during import (e.g., in CI), allow import to succeed
-            # Connection will be retried when app actually runs
             if os.getenv('CI') or os.getenv('GITHUB_ACTIONS'):
-                print(f"Warning: MongoDB connection skipped in CI environment: {e}")
+                print(f"Warning: MySQL connection skipped in CI environment: {e}")
             else:
-                raise
+                raise ConnectionError(f"MySQL connection failed: {e}")
     
-    return db
+    return db_connection
 
 # Initialize admin user if not exists (only when actually running, not during import)
 def init_admin():
     """Initialize admin user. Only runs when database is actually accessed."""
     try:
         get_db()  # Ensure database is connected
-        if users_collection and users_collection.count_documents({'role': 'admin'}) == 0:
-            users_collection.insert_one({
-                'username': 'admin',
-                'password': generate_password_hash('admin123'),
-                'email': 'admin@pharmacy.com',
-                'role': 'admin',
-                'created_at': datetime.utcnow()
-            })
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin'")
+        result = cursor.fetchone()
+        
+        if result and result['count'] == 0:
+            cursor.execute(
+                "INSERT INTO users (username, password, email, role) VALUES (%s, %s, %s, %s)",
+                ('admin', generate_password_hash('admin123'), 'admin@pharmacy.com', 'admin')
+            )
+            db_connection.commit()
             print("Default admin created: username='admin', password='admin123'")
+        cursor.close()
     except (ConnectionError, Exception) as e:
         # Silently fail during import/testing - will be initialized when app actually runs
         if not (os.getenv('CI') or os.getenv('GITHUB_ACTIONS')):
             print(f"Warning: Could not initialize admin: {e}")
 
 # Don't call init_admin() at import time - will be called when app starts
-
-# Helper function to convert ObjectId to string
-def serialize_doc(doc):
-    if doc and '_id' in doc:
-        doc['_id'] = str(doc['_id'])
-    return doc
 
 # Role-based access control decorators
 def role_required(*allowed_roles):
@@ -180,7 +168,12 @@ def role_required(*allowed_roles):
         @jwt_required()
         def decorated_function(*args, **kwargs):
             current_user = get_jwt_identity()
-            user = users_collection.find_one({'username': current_user})
+            get_db()
+            cursor = db_connection.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM users WHERE id = %s", (current_user,))
+            user = cursor.fetchone()
+            cursor.close()
+            
             if not user or user.get('role') not in allowed_roles:
                 return jsonify({'message': f'Access denied. Required roles: {", ".join(allowed_roles)}'}), 403
             return f(*args, **kwargs)
@@ -193,11 +186,11 @@ def admin_required(f):
     @jwt_required()
     def decorated_function(*args, **kwargs):
         user_id = get_jwt_identity()
-        try:
-            user = users_collection.find_one({'_id': ObjectId(user_id)})
-        except:
-            # Fallback for old username-based tokens
-            user = users_collection.find_one({'username': user_id})
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+        user = cursor.fetchone()
+        cursor.close()
         
         if not user or user.get('role') != 'admin':
             return jsonify({'message': 'Admin access required'}), 403
@@ -298,15 +291,22 @@ def unified_login():
     if not identifier or not password:
         return jsonify({'message': 'Identifier (username/phone) and password required'}), 400
     
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
     # Try to find user by username first (for admin)
-    user = users_collection.find_one({'username': identifier})
+    cursor.execute("SELECT * FROM users WHERE username = %s", (identifier,))
+    user = cursor.fetchone()
     
     # If not found by username, try by phone (for customer)
     if not user:
-        user = users_collection.find_one({'phone': identifier})
+        cursor.execute("SELECT * FROM users WHERE phone = %s", (identifier,))
+        user = cursor.fetchone()
+    
+    cursor.close()
     
     if user and check_password_hash(user['password'], password):
-        user_id = str(user['_id'])
+        user_id = str(user['id'])
         access_token = create_access_token(identity=user_id)
         
         response_data = {
@@ -365,10 +365,15 @@ def verify_token():
         description: User not found
     """
     user_id = get_jwt_identity()
-    user = users_collection.find_one({'_id': ObjectId(user_id)})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    
     if user:
         response_data = {
-            'user_id': str(user['_id']),
+            'user_id': str(user['id']),
             'role': user.get('role', 'customer')
         }
         
@@ -402,10 +407,14 @@ def admin_login():
     if not username or not password:
         return jsonify({'message': 'Username and password required'}), 400
     
-    # Use unified login logic
-    user = users_collection.find_one({'username': username})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+    user = cursor.fetchone()
+    cursor.close()
+    
     if user and check_password_hash(user['password'], password):
-        user_id = str(user['_id'])
+        user_id = str(user['id'])
         access_token = create_access_token(identity=user_id)
         return jsonify({
             'access_token': access_token,
@@ -427,7 +436,12 @@ def verify_admin_token():
     description: DEPRECATED - Use /api/verify instead.
     """
     user_id = get_jwt_identity()
-    user = users_collection.find_one({'_id': ObjectId(user_id)})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    
     if user:
         response_data = {
             'username': user.get('username'),
@@ -503,41 +517,37 @@ def register():
     if not all(field in data for field in required_fields):
         return jsonify({'message': 'Missing required fields: name, email, phone, password'}), 400
     
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
     # Check if user already exists
-    existing_user = users_collection.find_one({
-        '$or': [
-            {'email': data['email']},
-            {'phone': data['phone']}
-        ]
-    })
+    cursor.execute("SELECT * FROM users WHERE email = %s OR phone = %s", (data['email'], data['phone']))
+    existing_user = cursor.fetchone()
     if existing_user:
+        cursor.close()
         return jsonify({'message': 'Email or phone already exists'}), 400
     
     # Create user with default role 'customer'
-    user = {
-        'name': data['name'],
-        'email': data['email'],
-        'phone': data['phone'],
-        'password': generate_password_hash(data['password']),
-        'address': data.get('address', ''),
-        'role': 'customer',  # Default role
-        'created_at': datetime.utcnow()
-    }
-    
-    result = users_collection.insert_one(user)
-    user_id = str(result.inserted_id)
+    cursor.execute(
+        "INSERT INTO users (name, email, phone, password, address, role) VALUES (%s, %s, %s, %s, %s, %s)",
+        (data['name'], data['email'], data['phone'], generate_password_hash(data['password']), 
+         data.get('address', ''), 'customer')
+    )
+    user_id = cursor.lastrowid
+    db_connection.commit()
+    cursor.close()
     
     # Create access token
-    access_token = create_access_token(identity=user_id)
+    access_token = create_access_token(identity=str(user_id))
     
     return jsonify({
         'message': 'User registered successfully',
-        'user_id': user_id,
+        'user_id': str(user_id),
         'access_token': access_token,
-        'name': user['name'],
-        'email': user['email'],
-        'phone': user['phone'],
-        'role': user['role']
+        'name': data['name'],
+        'email': data['email'],
+        'phone': data['phone'],
+        'role': 'customer'
     }), 201
 
 # Keep old customer register for backward compatibility
@@ -556,10 +566,14 @@ def customer_login():
     if not phone or not password:
         return jsonify({'message': 'Phone number and password required'}), 400
     
-    # Use unified login logic
-    user = users_collection.find_one({'phone': phone, 'role': 'customer'})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE phone = %s AND role = 'customer'", (phone,))
+    user = cursor.fetchone()
+    cursor.close()
+    
     if user and check_password_hash(user['password'], password):
-        user_id = str(user['_id'])
+        user_id = str(user['id'])
         access_token = create_access_token(identity=user_id)
         return jsonify({
             'access_token': access_token,
@@ -576,10 +590,15 @@ def customer_login():
 def verify_customer_token():
     """Deprecated - Use /api/verify instead"""
     user_id = get_jwt_identity()
-    user = users_collection.find_one({'_id': ObjectId(user_id)})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    
     if user:
         return jsonify({
-            'customer_id': str(user['_id']),
+            'customer_id': str(user['id']),
             'name': user.get('name'),
             'email': user.get('email'),
             'phone': user.get('phone')
@@ -664,23 +683,29 @@ def create_user():
     if data['role'] not in ['admin', 'driver', 'helper']:
         return jsonify({'message': 'Invalid role. Allowed roles: admin, driver, helper'}), 400
     
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
     # Check if user already exists
-    existing_user = users_collection.find_one({'username': data['username']})
+    cursor.execute("SELECT * FROM users WHERE username = %s", (data['username'],))
+    existing_user = cursor.fetchone()
     if existing_user:
+        cursor.close()
         return jsonify({'message': 'Username already exists'}), 400
     
-    user = {
-        'username': data['username'],
-        'password': generate_password_hash(data['password']),
-        'email': data.get('email', ''),
-        'role': data['role'],
-        'created_at': datetime.utcnow()
-    }
+    cursor.execute(
+        "INSERT INTO users (username, password, email, role) VALUES (%s, %s, %s, %s)",
+        (data['username'], generate_password_hash(data['password']), data.get('email', ''), data['role'])
+    )
+    user_id = cursor.lastrowid
+    db_connection.commit()
     
-    result = users_collection.insert_one(user)
-    user['_id'] = str(result.inserted_id)
-    user.pop('password', None)  # Don't return password
-    return jsonify(serialize_doc(user)), 201
+    cursor.execute("SELECT id, username, email, role, created_at FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    
+    user['id'] = str(user['id'])
+    return jsonify(user), 201
 
 @app.route('/api/users', methods=['GET'])
 @admin_required
@@ -729,16 +754,22 @@ def get_users():
               example: "Admin access required"
     """
     role_filter = request.args.get('role', '')
-    query = {}
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
     if role_filter:
-        query = {'role': role_filter}
+        cursor.execute("SELECT id, username, email, role, created_at FROM users WHERE role = %s ORDER BY username", (role_filter,))
+    else:
+        cursor.execute("SELECT id, username, email, role, created_at FROM users ORDER BY username")
     
-    users = list(users_collection.find(query).sort('username', 1))
-    # Remove passwords from response
+    users = cursor.fetchall()
+    cursor.close()
+    
+    # Convert id to string
     for user in users:
-        user.pop('password', None)
+        user['id'] = str(user['id'])
     
-    return jsonify([serialize_doc(u) for u in users]), 200
+    return jsonify(users), 200
 
 @app.route('/api/users/<user_id>', methods=['PUT'])
 @admin_required
@@ -783,33 +814,42 @@ def update_user(user_id):
     """
     try:
         data = request.get_json()
-        update_data = {}
+        updates = []
+        params = []
         
         if 'password' in data:
-            update_data['password'] = generate_password_hash(data['password'])
+            updates.append("password = %s")
+            params.append(generate_password_hash(data['password']))
         if 'email' in data:
-            update_data['email'] = data['email']
+            updates.append("email = %s")
+            params.append(data['email'])
         if 'role' in data:
             if data['role'] not in ['admin', 'driver', 'helper']:
                 return jsonify({'message': 'Invalid role'}), 400
-            update_data['role'] = data['role']
+            updates.append("role = %s")
+            params.append(data['role'])
         
-        if not update_data:
+        if not updates:
             return jsonify({'message': 'No fields to update'}), 400
         
-        result = users_collection.update_one(
-            {'_id': ObjectId(user_id)},
-            {'$set': update_data}
-        )
+        params.append(user_id)
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = %s", params)
+        db_connection.commit()
         
-        if result.matched_count == 0:
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'User not found'}), 404
         
-        user = users_collection.find_one({'_id': ObjectId(user_id)})
-        user.pop('password', None)
-        return jsonify(serialize_doc(user)), 200
-    except:
-        return jsonify({'message': 'Invalid user ID'}), 400
+        cursor.execute("SELECT id, username, email, role, created_at FROM users WHERE id = %s", (user_id,))
+        user = cursor.fetchone()
+        cursor.close()
+        
+        user['id'] = str(user['id'])
+        return jsonify(user), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid user ID: {str(e)}'}), 400
 
 @app.route('/api/users/<user_id>', methods=['DELETE'])
 @admin_required
@@ -865,19 +905,20 @@ def delete_user(user_id):
                 type: string
                 example: https://example.com/image.jpg
     """
-    search = request.args.get('search', '')
-    query = {}
-    if search:
-        query = {
-            '$or': [
-                {'name': {'$regex': search, '$options': 'i'}},
-                {'description': {'$regex': search, '$options': 'i'}},
-                {'category': {'$regex': search, '$options': 'i'}}
-            ]
-        }
-    
-    products = list(products_collection.find(query).sort('name', 1))
-    return jsonify([serialize_doc(p) for p in products]), 200
+    try:
+        get_db()
+        cursor = db_connection.cursor()
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        db_connection.commit()
+        
+        if cursor.rowcount == 0:
+            cursor.close()
+            return jsonify({'message': 'User not found'}), 404
+        
+        cursor.close()
+        return jsonify({'message': 'User deleted successfully'}), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid user ID: {str(e)}'}), 400
 
 @app.route('/api/products/<product_id>', methods=['GET'])
 def get_product(product_id):
@@ -920,12 +961,18 @@ def get_product(product_id):
         description: Product not found
     """
     try:
-        product = products_collection.find_one({'_id': ObjectId(product_id)})
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
+        product = cursor.fetchone()
+        cursor.close()
+        
         if product:
-            return jsonify(serialize_doc(product)), 200
+            product['id'] = str(product['id'])
+            return jsonify(product), 200
         return jsonify({'message': 'Product not found'}), 404
-    except:
-        return jsonify({'message': 'Invalid product ID'}), 400
+    except Exception as e:
+        return jsonify({'message': f'Invalid product ID: {str(e)}'}), 400
 
 @app.route('/api/products', methods=['POST'])
 @admin_required
@@ -993,20 +1040,22 @@ def create_product():
     if not all(field in data for field in required_fields):
         return jsonify({'message': 'Missing required fields'}), 400
     
-    product = {
-        'name': data['name'],
-        'description': data.get('description', ''),
-        'price': float(data['price']),
-        'stock': int(data['stock']),
-        'category': data.get('category', 'General'),
-        'image': data.get('image', ''),
-        'created_at': datetime.utcnow(),
-        'updated_at': datetime.utcnow()
-    }
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute(
+        "INSERT INTO products (name, description, price, stock, category, image) VALUES (%s, %s, %s, %s, %s, %s)",
+        (data['name'], data.get('description', ''), float(data['price']), int(data['stock']), 
+         data.get('category', 'General'), data.get('image', ''))
+    )
+    product_id = cursor.lastrowid
+    db_connection.commit()
     
-    result = products_collection.insert_one(product)
-    product['_id'] = str(result.inserted_id)
-    return jsonify(serialize_doc(product)), 201
+    cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
+    product = cursor.fetchone()
+    cursor.close()
+    
+    product['id'] = str(product['id'])
+    return jsonify(product), 201
 
 @app.route('/api/products/<product_id>', methods=['PUT'])
 @admin_required
@@ -1065,35 +1114,49 @@ def update_product(product_id):
     """
     try:
         data = request.get_json()
-        update_data = {
-            'updated_at': datetime.utcnow()
-        }
+        updates = []
+        params = []
         
         if 'name' in data:
-            update_data['name'] = data['name']
+            updates.append("name = %s")
+            params.append(data['name'])
         if 'description' in data:
-            update_data['description'] = data['description']
+            updates.append("description = %s")
+            params.append(data['description'])
         if 'price' in data:
-            update_data['price'] = float(data['price'])
+            updates.append("price = %s")
+            params.append(float(data['price']))
         if 'stock' in data:
-            update_data['stock'] = int(data['stock'])
+            updates.append("stock = %s")
+            params.append(int(data['stock']))
         if 'category' in data:
-            update_data['category'] = data['category']
+            updates.append("category = %s")
+            params.append(data['category'])
         if 'image' in data:
-            update_data['image'] = data['image']
+            updates.append("image = %s")
+            params.append(data['image'])
         
-        result = products_collection.update_one(
-            {'_id': ObjectId(product_id)},
-            {'$set': update_data}
-        )
+        if not updates:
+            return jsonify({'message': 'No fields to update'}), 400
         
-        if result.matched_count == 0:
+        params.append(product_id)
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute(f"UPDATE products SET {', '.join(updates)} WHERE id = %s", params)
+        db_connection.commit()
+        
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Product not found'}), 404
         
-        product = products_collection.find_one({'_id': ObjectId(product_id)})
-        return jsonify(serialize_doc(product)), 200
-    except:
-        return jsonify({'message': 'Invalid product ID'}), 400
+        cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
+        product = cursor.fetchone()
+        cursor.close()
+        
+        product['id'] = str(product['id'])
+        return jsonify(product), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid product ID: {str(e)}'}), 400
 
 @app.route('/api/products/<product_id>', methods=['DELETE'])
 @admin_required
@@ -1124,12 +1187,61 @@ def delete_product(product_id):
         description: Admin access required
     """
     try:
-        result = products_collection.delete_one({'_id': ObjectId(product_id)})
-        if result.deleted_count == 0:
+        get_db()
+        cursor = db_connection.cursor()
+        cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
+        db_connection.commit()
+        
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Product not found'}), 404
+        
+        cursor.close()
         return jsonify({'message': 'Product deleted successfully'}), 200
-    except:
-        return jsonify({'message': 'Invalid product ID'}), 400
+    except Exception as e:
+        return jsonify({'message': f'Invalid product ID: {str(e)}'}), 400
+
+# ==================== PRODUCT ROUTES (LIST) ====================
+
+@app.route('/api/products', methods=['GET'])
+def get_products():
+    """
+    Get Products
+    ---
+    tags:
+      - Products
+    summary: Get all products
+    description: Retrieve all products. Supports search filtering.
+    parameters:
+      - in: query
+        name: search
+        type: string
+        required: false
+        description: Search products by name, description, or category
+    responses:
+      200:
+        description: List of products
+    """
+    search = request.args.get('search', '')
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
+    if search:
+        cursor.execute(
+            "SELECT * FROM products WHERE name LIKE %s OR description LIKE %s OR category LIKE %s ORDER BY name",
+            (f'%{search}%', f'%{search}%', f'%{search}%')
+        )
+    else:
+        cursor.execute("SELECT * FROM products ORDER BY name")
+    
+    products = cursor.fetchall()
+    cursor.close()
+    
+    # Convert id to string
+    for product in products:
+        product['id'] = str(product['id'])
+    
+    return jsonify(products), 200
 
 # ==================== ORDER ROUTES ====================
 
@@ -1229,37 +1341,52 @@ def create_order():
     offer_code = data.get('offer_code', '')
     discount = 0
     
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
     if offer_code:
-        offer = offers_collection.find_one({'code': offer_code, 'active': True})
+        cursor.execute("SELECT * FROM offers WHERE code = %s AND active = TRUE", (offer_code,))
+        offer = cursor.fetchone()
         if offer:
             if offer['type'] == 'percentage':
-                discount = final_total * (offer['value'] / 100)
+                discount = final_total * (float(offer['value']) / 100)
             else:
-                discount = offer['value']
+                discount = float(offer['value'])
             final_total = max(0, final_total - discount)
     
-    order = {
-        'customer': customer,
-        'items': data['items'],
-        'subtotal': float(data['total']),
-        'discount': discount,
-        'total': final_total,
-        'offer_code': offer_code if offer_code else None,
-        'status': 'pending',
-        'created_at': datetime.utcnow()
-    }
-    
-    result = orders_collection.insert_one(order)
-    order['_id'] = str(result.inserted_id)
+    # Insert order
+    cursor.execute(
+        "INSERT INTO orders (customer_name, customer_phone, customer_address, items, subtotal, discount, total, offer_code, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (customer['name'], customer['phone'], customer['address'], json.dumps(data['items']), 
+         float(data['total']), discount, final_total, offer_code if offer_code else None, 'pending')
+    )
+    order_id = cursor.lastrowid
+    db_connection.commit()
     
     # Update product stock
     for item in data['items']:
-        products_collection.update_one(
-            {'_id': ObjectId(item['product_id'])},
-            {'$inc': {'stock': -item['quantity']}}
-        )
+        cursor.execute("UPDATE products SET stock = stock - %s WHERE id = %s", (item['quantity'], item['product_id']))
+    db_connection.commit()
     
-    return jsonify(serialize_doc(order)), 201
+    # Fetch created order
+    cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+    order = cursor.fetchone()
+    cursor.close()
+    
+    # Format response
+    order['id'] = str(order['id'])
+    order['items'] = json.loads(order['items'])
+    order['customer'] = {
+        'name': order['customer_name'],
+        'phone': order['customer_phone'],
+        'address': order['customer_address']
+    }
+    # Remove individual customer fields
+    order.pop('customer_name', None)
+    order.pop('customer_phone', None)
+    order.pop('customer_address', None)
+    
+    return jsonify(order), 201
 
 @app.route('/api/orders', methods=['GET'])
 def get_orders():
@@ -1297,13 +1424,33 @@ def get_orders():
                 type: string
     """
     phone = request.args.get('phone', '')
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
     
     if phone:
-        orders = list(orders_collection.find({'customer.phone': phone}).sort('created_at', -1))
+        cursor.execute("SELECT * FROM orders WHERE customer_phone = %s ORDER BY created_at DESC", (phone,))
     else:
-        orders = list(orders_collection.find({}).sort('created_at', -1))
+        cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
     
-    return jsonify([serialize_doc(o) for o in orders]), 200
+    orders = cursor.fetchall()
+    cursor.close()
+    
+    # Format orders for response
+    formatted_orders = []
+    for order in orders:
+        order['id'] = str(order['id'])
+        order['items'] = json.loads(order['items'])
+        order['customer'] = {
+            'name': order['customer_name'],
+            'phone': order['customer_phone'],
+            'address': order['customer_address']
+        }
+        order.pop('customer_name', None)
+        order.pop('customer_phone', None)
+        order.pop('customer_address', None)
+        formatted_orders.append(order)
+    
+    return jsonify(formatted_orders), 200
 
 @app.route('/api/orders/<order_id>', methods=['GET'])
 def get_order(order_id):
@@ -1342,12 +1489,27 @@ def get_order(order_id):
         description: Order not found
     """
     try:
-        order = orders_collection.find_one({'_id': ObjectId(order_id)})
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+        order = cursor.fetchone()
+        cursor.close()
+        
         if order:
-            return jsonify(serialize_doc(order)), 200
+            order['id'] = str(order['id'])
+            order['items'] = json.loads(order['items'])
+            order['customer'] = {
+                'name': order['customer_name'],
+                'phone': order['customer_phone'],
+                'address': order['customer_address']
+            }
+            order.pop('customer_name', None)
+            order.pop('customer_phone', None)
+            order.pop('customer_address', None)
+            return jsonify(order), 200
         return jsonify({'message': 'Order not found'}), 404
-    except:
-        return jsonify({'message': 'Invalid order ID'}), 400
+    except Exception as e:
+        return jsonify({'message': f'Invalid order ID: {str(e)}'}), 400
 
 @app.route('/api/orders/<order_id>', methods=['PUT'])
 @admin_required
@@ -1403,18 +1565,33 @@ def update_order_status(order_id):
         if status not in ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled']:
             return jsonify({'message': 'Invalid status'}), 400
         
-        result = orders_collection.update_one(
-            {'_id': ObjectId(order_id)},
-            {'$set': {'status': status, 'updated_at': datetime.utcnow()}}
-        )
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
+        db_connection.commit()
         
-        if result.matched_count == 0:
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Order not found'}), 404
         
-        order = orders_collection.find_one({'_id': ObjectId(order_id)})
-        return jsonify(serialize_doc(order)), 200
-    except:
-        return jsonify({'message': 'Invalid order ID'}), 400
+        cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+        order = cursor.fetchone()
+        cursor.close()
+        
+        order['id'] = str(order['id'])
+        order['items'] = json.loads(order['items'])
+        order['customer'] = {
+            'name': order['customer_name'],
+            'phone': order['customer_phone'],
+            'address': order['customer_address']
+        }
+        order.pop('customer_name', None)
+        order.pop('customer_phone', None)
+        order.pop('customer_address', None)
+        
+        return jsonify(order), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid order ID: {str(e)}'}), 400
 
 # ==================== OFFER ROUTES ====================
 
@@ -1455,9 +1632,21 @@ def get_offers():
                 type: boolean
     """
     active_only = request.args.get('active', 'true').lower() == 'true'
-    query = {'active': True} if active_only else {}
-    offers = list(offers_collection.find(query).sort('created_at', -1))
-    return jsonify([serialize_doc(o) for o in offers]), 200
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
+    if active_only:
+        cursor.execute("SELECT * FROM offers WHERE active = TRUE ORDER BY created_at DESC")
+    else:
+        cursor.execute("SELECT * FROM offers ORDER BY created_at DESC")
+    
+    offers = cursor.fetchall()
+    cursor.close()
+    
+    for offer in offers:
+        offer['id'] = str(offer['id'])
+    
+    return jsonify(offers), 200
 
 @app.route('/api/offers/<offer_code>', methods=['GET'])
 def get_offer(offer_code):
@@ -1494,9 +1683,15 @@ def get_offer(offer_code):
       404:
         description: Offer not found or inactive
     """
-    offer = offers_collection.find_one({'code': offer_code, 'active': True})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM offers WHERE code = %s AND active = TRUE", (offer_code,))
+    offer = cursor.fetchone()
+    cursor.close()
+    
     if offer:
-        return jsonify(serialize_doc(offer)), 200
+        offer['id'] = str(offer['id'])
+        return jsonify(offer), 200
     return jsonify({'message': 'Offer not found or inactive'}), 404
 
 @app.route('/api/offers', methods=['POST'])
@@ -1566,24 +1761,29 @@ def create_offer():
     if data['type'] not in ['percentage', 'fixed']:
         return jsonify({'message': 'Invalid offer type'}), 400
     
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
     # Check if code already exists
-    existing = offers_collection.find_one({'code': data['code']})
+    cursor.execute("SELECT * FROM offers WHERE code = %s", (data['code'].upper(),))
+    existing = cursor.fetchone()
     if existing:
+        cursor.close()
         return jsonify({'message': 'Offer code already exists'}), 400
     
-    offer = {
-        'code': data['code'].upper(),
-        'type': data['type'],
-        'value': float(data['value']),
-        'description': data.get('description', ''),
-        'active': data.get('active', True),
-        'created_at': datetime.utcnow(),
-        'updated_at': datetime.utcnow()
-    }
+    cursor.execute(
+        "INSERT INTO offers (code, type, value, description, active) VALUES (%s, %s, %s, %s, %s)",
+        (data['code'].upper(), data['type'], float(data['value']), data.get('description', ''), data.get('active', True))
+    )
+    offer_id = cursor.lastrowid
+    db_connection.commit()
     
-    result = offers_collection.insert_one(offer)
-    offer['_id'] = str(result.inserted_id)
-    return jsonify(serialize_doc(offer)), 201
+    cursor.execute("SELECT * FROM offers WHERE id = %s", (offer_id,))
+    offer = cursor.fetchone()
+    cursor.close()
+    
+    offer['id'] = str(offer['id'])
+    return jsonify(offer), 201
 
 @app.route('/api/offers/<offer_id>', methods=['PUT'])
 @admin_required
@@ -1637,31 +1837,45 @@ def update_offer(offer_id):
     """
     try:
         data = request.get_json()
-        update_data = {'updated_at': datetime.utcnow()}
+        updates = []
+        params = []
         
         if 'type' in data:
             if data['type'] not in ['percentage', 'fixed']:
                 return jsonify({'message': 'Invalid offer type'}), 400
-            update_data['type'] = data['type']
+            updates.append("type = %s")
+            params.append(data['type'])
         if 'value' in data:
-            update_data['value'] = float(data['value'])
+            updates.append("value = %s")
+            params.append(float(data['value']))
         if 'description' in data:
-            update_data['description'] = data['description']
+            updates.append("description = %s")
+            params.append(data['description'])
         if 'active' in data:
-            update_data['active'] = data['active']
+            updates.append("active = %s")
+            params.append(data['active'])
         
-        result = offers_collection.update_one(
-            {'_id': ObjectId(offer_id)},
-            {'$set': update_data}
-        )
+        if not updates:
+            return jsonify({'message': 'No fields to update'}), 400
         
-        if result.matched_count == 0:
+        params.append(offer_id)
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute(f"UPDATE offers SET {', '.join(updates)} WHERE id = %s", params)
+        db_connection.commit()
+        
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Offer not found'}), 404
         
-        offer = offers_collection.find_one({'_id': ObjectId(offer_id)})
-        return jsonify(serialize_doc(offer)), 200
-    except:
-        return jsonify({'message': 'Invalid offer ID'}), 400
+        cursor.execute("SELECT * FROM offers WHERE id = %s", (offer_id,))
+        offer = cursor.fetchone()
+        cursor.close()
+        
+        offer['id'] = str(offer['id'])
+        return jsonify(offer), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid offer ID: {str(e)}'}), 400
 
 @app.route('/api/offers/<offer_id>', methods=['DELETE'])
 @admin_required
@@ -1692,12 +1906,19 @@ def delete_offer(offer_id):
         description: Admin access required
     """
     try:
-        result = offers_collection.delete_one({'_id': ObjectId(offer_id)})
-        if result.deleted_count == 0:
+        get_db()
+        cursor = db_connection.cursor()
+        cursor.execute("DELETE FROM offers WHERE id = %s", (offer_id,))
+        db_connection.commit()
+        
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Offer not found'}), 404
+        
+        cursor.close()
         return jsonify({'message': 'Offer deleted successfully'}), 200
-    except:
-        return jsonify({'message': 'Invalid offer ID'}), 400
+    except Exception as e:
+        return jsonify({'message': f'Invalid offer ID: {str(e)}'}), 400
 
 # ==================== TESTIMONIALS ROUTES ====================
 
@@ -1739,9 +1960,21 @@ def get_testimonials():
                 type: string
     """
     approved_only = request.args.get('approved', 'true').lower() == 'true'
-    query = {'approved': True} if approved_only else {}
-    testimonials = list(testimonials_collection.find(query).sort('created_at', -1))
-    return jsonify([serialize_doc(t) for t in testimonials]), 200
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    
+    if approved_only:
+        cursor.execute("SELECT * FROM testimonials WHERE approved = TRUE ORDER BY created_at DESC")
+    else:
+        cursor.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
+    
+    testimonials = cursor.fetchall()
+    cursor.close()
+    
+    for testimonial in testimonials:
+        testimonial['id'] = str(testimonial['id'])
+    
+    return jsonify(testimonials), 200
 
 @app.route('/api/testimonials', methods=['POST'])
 def create_testimonial():
@@ -1796,17 +2029,21 @@ def create_testimonial():
     if not all(field in data for field in required_fields):
         return jsonify({'message': 'Missing required fields: customer_name, review'}), 400
     
-    testimonial = {
-        'customer_name': data['customer_name'],
-        'review': data['review'],
-        'rating': data.get('rating', 5),
-        'approved': False,  # Requires admin approval
-        'created_at': datetime.utcnow()
-    }
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute(
+        "INSERT INTO testimonials (customer_name, review, rating, approved) VALUES (%s, %s, %s, %s)",
+        (data['customer_name'], data['review'], data.get('rating', 5), False)
+    )
+    testimonial_id = cursor.lastrowid
+    db_connection.commit()
     
-    result = testimonials_collection.insert_one(testimonial)
-    testimonial['_id'] = str(result.inserted_id)
-    return jsonify(serialize_doc(testimonial)), 201
+    cursor.execute("SELECT * FROM testimonials WHERE id = %s", (testimonial_id,))
+    testimonial = cursor.fetchone()
+    cursor.close()
+    
+    testimonial['id'] = str(testimonial['id'])
+    return jsonify(testimonial), 201
 
 @app.route('/api/testimonials/<testimonial_id>', methods=['PUT'])
 @admin_required
@@ -1851,32 +2088,43 @@ def update_testimonial(testimonial_id):
     """
     try:
         data = request.get_json()
-        update_data = {}
+        updates = []
+        params = []
         
         if 'customer_name' in data:
-            update_data['customer_name'] = data['customer_name']
+            updates.append("customer_name = %s")
+            params.append(data['customer_name'])
         if 'review' in data:
-            update_data['review'] = data['review']
+            updates.append("review = %s")
+            params.append(data['review'])
         if 'rating' in data:
-            update_data['rating'] = int(data['rating'])
+            updates.append("rating = %s")
+            params.append(int(data['rating']))
         if 'approved' in data:
-            update_data['approved'] = data['approved']
+            updates.append("approved = %s")
+            params.append(data['approved'])
         
-        if not update_data:
+        if not updates:
             return jsonify({'message': 'No fields to update'}), 400
         
-        result = testimonials_collection.update_one(
-            {'_id': ObjectId(testimonial_id)},
-            {'$set': update_data}
-        )
+        params.append(testimonial_id)
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute(f"UPDATE testimonials SET {', '.join(updates)} WHERE id = %s", params)
+        db_connection.commit()
         
-        if result.matched_count == 0:
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Testimonial not found'}), 404
         
-        testimonial = testimonials_collection.find_one({'_id': ObjectId(testimonial_id)})
-        return jsonify(serialize_doc(testimonial)), 200
-    except:
-        return jsonify({'message': 'Invalid testimonial ID'}), 400
+        cursor.execute("SELECT * FROM testimonials WHERE id = %s", (testimonial_id,))
+        testimonial = cursor.fetchone()
+        cursor.close()
+        
+        testimonial['id'] = str(testimonial['id'])
+        return jsonify(testimonial), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid testimonial ID: {str(e)}'}), 400
 
 @app.route('/api/testimonials/<testimonial_id>', methods=['DELETE'])
 @admin_required
@@ -1906,12 +2154,19 @@ def delete_testimonial(testimonial_id):
         description: Admin access required
     """
     try:
-        result = testimonials_collection.delete_one({'_id': ObjectId(testimonial_id)})
-        if result.deleted_count == 0:
+        get_db()
+        cursor = db_connection.cursor()
+        cursor.execute("DELETE FROM testimonials WHERE id = %s", (testimonial_id,))
+        db_connection.commit()
+        
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Testimonial not found'}), 404
+        
+        cursor.close()
         return jsonify({'message': 'Testimonial deleted successfully'}), 200
-    except:
-        return jsonify({'message': 'Invalid testimonial ID'}), 400
+    except Exception as e:
+        return jsonify({'message': f'Invalid testimonial ID: {str(e)}'}), 400
 
 # ==================== CALLBACK REQUESTS ROUTES ====================
 
@@ -1972,19 +2227,22 @@ def create_callback_request():
     if not all(field in data for field in required_fields):
         return jsonify({'message': 'Missing required fields: name, phone'}), 400
     
-    callback_request = {
-        'name': data['name'],
-        'phone': data['phone'],
-        'email': data.get('email', ''),
-        'medicine': data.get('medicine', ''),
-        'message': data.get('message', ''),
-        'status': 'pending',
-        'created_at': datetime.utcnow()
-    }
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
+    cursor.execute(
+        "INSERT INTO callback_requests (name, phone, email, medicine, message, status) VALUES (%s, %s, %s, %s, %s, %s)",
+        (data['name'], data['phone'], data.get('email', ''), data.get('medicine', ''), 
+         data.get('message', ''), 'pending')
+    )
+    request_id = cursor.lastrowid
+    db_connection.commit()
     
-    result = callback_requests_collection.insert_one(callback_request)
-    callback_request['_id'] = str(result.inserted_id)
-    return jsonify(serialize_doc(callback_request)), 201
+    cursor.execute("SELECT * FROM callback_requests WHERE id = %s", (request_id,))
+    callback_request = cursor.fetchone()
+    cursor.close()
+    
+    callback_request['id'] = str(callback_request['id'])
+    return jsonify(callback_request), 201
 
 @app.route('/api/callback-requests', methods=['GET'])
 @admin_required
@@ -2015,12 +2273,21 @@ def get_callback_requests():
         description: Admin access required
     """
     status_filter = request.args.get('status', '')
-    query = {}
-    if status_filter:
-        query = {'status': status_filter}
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
     
-    requests = list(callback_requests_collection.find(query).sort('created_at', -1))
-    return jsonify([serialize_doc(r) for r in requests]), 200
+    if status_filter:
+        cursor.execute("SELECT * FROM callback_requests WHERE status = %s ORDER BY created_at DESC", (status_filter,))
+    else:
+        cursor.execute("SELECT * FROM callback_requests ORDER BY created_at DESC")
+    
+    requests = cursor.fetchall()
+    cursor.close()
+    
+    for req in requests:
+        req['id'] = str(req['id'])
+    
+    return jsonify(requests), 200
 
 @app.route('/api/callback-requests/<request_id>', methods=['PUT'])
 @admin_required
@@ -2065,25 +2332,26 @@ def update_callback_request(request_id):
         if status and status not in ['pending', 'contacted', 'completed']:
             return jsonify({'message': 'Invalid status'}), 400
         
-        update_data = {}
-        if 'status' in data:
-            update_data['status'] = status
-        
-        if not update_data:
+        if not status:
             return jsonify({'message': 'No fields to update'}), 400
         
-        result = callback_requests_collection.update_one(
-            {'_id': ObjectId(request_id)},
-            {'$set': update_data}
-        )
+        get_db()
+        cursor = db_connection.cursor(dictionary=True)
+        cursor.execute("UPDATE callback_requests SET status = %s WHERE id = %s", (status, request_id))
+        db_connection.commit()
         
-        if result.matched_count == 0:
+        if cursor.rowcount == 0:
+            cursor.close()
             return jsonify({'message': 'Request not found'}), 404
         
-        request_doc = callback_requests_collection.find_one({'_id': ObjectId(request_id)})
-        return jsonify(serialize_doc(request_doc)), 200
-    except:
-        return jsonify({'message': 'Invalid request ID'}), 400
+        cursor.execute("SELECT * FROM callback_requests WHERE id = %s", (request_id,))
+        request_doc = cursor.fetchone()
+        cursor.close()
+        
+        request_doc['id'] = str(request_doc['id'])
+        return jsonify(request_doc), 200
+    except Exception as e:
+        return jsonify({'message': f'Invalid request ID: {str(e)}'}), 400
 
 # ==================== DASHBOARD STATS ====================
 
@@ -2126,33 +2394,53 @@ def get_dashboard_stats():
       403:
         description: Forbidden - Admin access required
     """
-    total_products = products_collection.count_documents({})
-    total_orders = orders_collection.count_documents({})
-    pending_orders = orders_collection.count_documents({'status': 'pending'})
+    get_db()
+    cursor = db_connection.cursor(dictionary=True)
     
-    # Calculate total revenue
-    pipeline = [
-        {'$match': {'status': {'$ne': 'cancelled'}}},
-        {'$group': {'_id': None, 'total': {'$sum': '$total'}}}
-    ]
-    revenue_result = list(orders_collection.aggregate(pipeline))
-    total_revenue = revenue_result[0]['total'] if revenue_result else 0
+    cursor.execute("SELECT COUNT(*) as count FROM products")
+    total_products = cursor.fetchone()['count']
     
-    # Recent orders
-    recent_orders = list(orders_collection.find({}).sort('created_at', -1).limit(5))
+    cursor.execute("SELECT COUNT(*) as count FROM orders")
+    total_orders = cursor.fetchone()['count']
+    
+    cursor.execute("SELECT COUNT(*) as count FROM orders WHERE status = 'pending'")
+    pending_orders = cursor.fetchone()['count']
+    
+    cursor.execute("SELECT SUM(total) as total FROM orders WHERE status != 'cancelled'")
+    revenue_result = cursor.fetchone()
+    total_revenue = float(revenue_result['total']) if revenue_result['total'] else 0
+    
+    cursor.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 5")
+    recent_orders = cursor.fetchall()
+    cursor.close()
+    
+    # Format recent orders
+    formatted_orders = []
+    for order in recent_orders:
+        order['id'] = str(order['id'])
+        order['items'] = json.loads(order['items'])
+        order['customer'] = {
+            'name': order['customer_name'],
+            'phone': order['customer_phone'],
+            'address': order['customer_address']
+        }
+        order.pop('customer_name', None)
+        order.pop('customer_phone', None)
+        order.pop('customer_address', None)
+        formatted_orders.append(order)
     
     return jsonify({
         'total_products': total_products,
         'total_orders': total_orders,
         'pending_orders': pending_orders,
         'total_revenue': total_revenue,
-        'recent_orders': [serialize_doc(o) for o in recent_orders]
+        'recent_orders': formatted_orders
     }), 200
 
 # Ensure database is connected before handling requests (skip for OPTIONS)
 @app.before_request
 def ensure_db_connection():
-    """Ensure MongoDB connection is established before handling requests."""
+    """Ensure MySQL connection is established before handling requests."""
     # Skip database connection for OPTIONS requests
     if request.method == "OPTIONS":
         return
@@ -2171,7 +2459,7 @@ if __name__ == '__main__':
         init_admin()
     except Exception as e:
         print(f"Warning: Could not initialize database: {e}")
-        print("App will start but database operations will fail until MONGO_URI is configured.")
+        print("App will start but database operations will fail until MySQL connection is configured.")
     
     # Get port from environment variable (for Deta Space, Render, Railway, etc.)
     port = int(os.getenv('PORT', 5000))
